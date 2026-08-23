@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { Search, Filter, Plus, Download, Users, ShoppingCart, CreditCard, X, Check } from 'lucide-react';
 import { getSuppliers, addSupplier, Supplier, getInventory, getLogs, updateLog, StockLog } from '../lib/db';
 import { format } from 'date-fns';
+import { cn } from '../lib/utils';
 import { useSettings } from '../context/SettingsContext';
 
 export default function Suppliers() {
