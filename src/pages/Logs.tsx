@@ -233,7 +233,7 @@ export default function Logs() {
           </table>
         </div>
         <div className="p-4 border-t border-slate-800 flex justify-between items-center bg-[#0f172a]/50">
-          <p className="text-sm text-slate-400">Showing <span className="text-white">1</span> to <span className="text-white">{logs.length}</span> of <span className="text-white">{logs.length}</span> entries</p>
+          <p className="text-sm text-slate-400">Showing <span className="text-white">{filteredLogs.length > 0 ? 1 : 0}</span> to <span className="text-white">{filteredLogs.length}</span> of <span className="text-white">{filteredLogs.length}</span> entries</p>
           <div className="flex gap-2">
             <button className="px-4 py-2 bg-[#1e293b] border border-slate-700 rounded-lg text-sm text-slate-300 hover:bg-slate-800 transition-colors">Previous</button>
             <button className="px-4 py-2 bg-[#1e293b] border border-slate-700 rounded-lg text-sm text-slate-300 hover:bg-slate-800 transition-colors">Next</button>

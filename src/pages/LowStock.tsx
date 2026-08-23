@@ -98,7 +98,7 @@ export default function LowStock() {
   };
 
   const handleExportCSV = () => {
-    if (filteredItems.length === 0) {
+    if (items.length === 0) {
       alert('No low stock items to export.');
       return;
     }
@@ -106,7 +106,7 @@ export default function LowStock() {
     const headers = ['Medicine Name', 'Brand', 'Quantity Available', 'Supplier', 'Threshold Value'];
     const csvContent = [
       headers.join(','),
-      ...filteredItems.map(item => {
+      ...items.map(item => {
         const supplier = suppliers.find(s => s.id === item.supplier_id)?.name || 'N/A';
         return [
           `"${item.medicine_name}"`,

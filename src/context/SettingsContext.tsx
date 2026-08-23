@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
-import { getSettings, updateSettings as dbUpdateSettings } from '../lib/db';
+import { getSettings, saveSettings as dbUpdateSettings } from '../lib/db';
 
 interface Settings {
   id?: number;

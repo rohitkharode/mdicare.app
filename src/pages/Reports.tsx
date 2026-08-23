@@ -492,5 +492,3 @@ export default function Reports() {
     </div>
   );
 }
-
-import { BarChart as BarChart2 } from 'lucide-react';
