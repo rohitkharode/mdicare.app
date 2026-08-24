@@ -310,25 +310,43 @@ export const createBill = async (bill: Omit<Bill, 'bill_id'>): Promise<string> =
   let newBillId = `${prefix}0001`;
 
   await runTransaction(firestoreDb, async (transaction) => {
+    // READ 1: Metadata
     const metaSnap = await transaction.get(metaRef);
     let lastId = 0;
     if (metaSnap.exists()) {
       lastId = metaSnap.data().last_bill_id || 0;
     }
     lastId += 1;
+    newBillId = `${prefix}${lastId.toString().padStart(4, '0')}`;
+
+    // READ 2: Inventory Items BEFORE ANY WRITES
+    const invItemsToUpdate: { ref: any; data: InventoryItem; item: BillingItem }[] = [];
+    for (const item of bill.items) {
+      const itemKey = String(item.medicine_id || item.item_id);
+      const invRef = doc(firestoreDb, 'pharmacies', pharmacyId, 'medicines', itemKey);
+      const invSnap = await transaction.get(invRef);
+      if (invSnap.exists()) {
+        invItemsToUpdate.push({
+          ref: invRef,
+          data: invSnap.data() as InventoryItem,
+          item
+        });
+      }
+    }
+
+    // NOW EXECUTE WRITES:
+    // 1. Update metadata
     transaction.set(metaRef, { last_bill_id: lastId }, { merge: true });
 
-    newBillId = `${prefix}${lastId.toString().padStart(4, '0')}`;
+    // 2. Add Bill
     const billRef = doc(firestoreDb, 'pharmacies', pharmacyId, 'bills', newBillId);
-
     const finalBill: Bill = {
       ...bill,
       bill_id: newBillId
     };
-
     transaction.set(billRef, finalBill);
 
-    // Notification
+    // 3. Notification
     const notifRef = doc(collection(firestoreDb, 'pharmacies', pharmacyId, 'notifications'));
     transaction.set(notifRef, {
       title: 'New Bill Created',
@@ -338,45 +356,38 @@ export const createBill = async (bill: Omit<Bill, 'bill_id'>): Promise<string> =
       read: false
     });
 
-    // Update inventory
+    // 4. Update Inventory & Logs
     const threshold = settings?.global_low_stock_threshold || 50;
 
-    for (const item of finalBill.items) {
-      const itemKey = String(item.medicine_id || item.item_id);
-      const invRef = doc(firestoreDb, 'pharmacies', pharmacyId, 'medicines', itemKey);
-      const invSnap = await transaction.get(invRef);
-      if (invSnap.exists()) {
-        const invData = invSnap.data() as InventoryItem;
-        const oldQty = invData.total_qty;
-        const newQty = invData.total_qty - item.qty;
+    for (const { ref, data: invData, item } of invItemsToUpdate) {
+      const oldQty = invData.total_qty;
+      const newQty = invData.total_qty - item.qty;
 
-        transaction.update(invRef, {
-          total_qty: newQty,
-          updated_at: new Date().toISOString()
+      transaction.update(ref, {
+        total_qty: newQty,
+        updated_at: new Date().toISOString()
+      });
+
+      const logRef = doc(collection(firestoreDb, 'pharmacies', pharmacyId, 'inventoryLogs'));
+      transaction.set(logRef, {
+        medicine_id: String(item.medicine_id || item.item_id),
+        medicine_name: invData.medicine_name,
+        batch_no: invData.batch_no,
+        change_type: 'sale',
+        qty_change: -item.qty,
+        updated_total: newQty,
+        timestamp: new Date().toISOString()
+      });
+
+      if (oldQty > threshold && newQty <= threshold) {
+        const lowNotifRef = doc(collection(firestoreDb, 'pharmacies', pharmacyId, 'notifications'));
+        transaction.set(lowNotifRef, {
+          title: 'Low Stock Alert',
+          message: `${invData.medicine_name} has dropped to ${newQty} units.`,
+          timestamp: new Date().toISOString(),
+          type: 'low_stock',
+          read: false
         });
-
-        // Log
-        const logRef = doc(collection(firestoreDb, 'pharmacies', pharmacyId, 'inventoryLogs'));
-        transaction.set(logRef, {
-          medicine_id: itemKey,
-          medicine_name: invData.medicine_name,
-          batch_no: invData.batch_no,
-          change_type: 'sale',
-          qty_change: -item.qty,
-          updated_total: newQty,
-          timestamp: new Date().toISOString()
-        });
-
-        if (oldQty > threshold && newQty <= threshold) {
-          const lowNotifRef = doc(collection(firestoreDb, 'pharmacies', pharmacyId, 'notifications'));
-          transaction.set(lowNotifRef, {
-            title: 'Low Stock Alert',
-            message: `${invData.medicine_name} has dropped to ${newQty} units.`,
-            timestamp: new Date().toISOString(),
-            type: 'low_stock',
-            read: false
-          });
-        }
       }
     }
   });
