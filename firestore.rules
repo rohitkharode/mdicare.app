@@ -1,0 +1,25 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // User profile documents
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // Pharmacy documents and subcollections
+    match /pharmacies/{pharmacyId} {
+      // Allow read/write if the pharmacyId matches pharmacy_{request.auth.uid} or user is the pharmacy owner
+      allow read, write: if request.auth != null && (
+        pharmacyId == 'pharmacy_' + request.auth.uid ||
+        resource == null ||
+        resource.data.ownerId == request.auth.uid
+      );
+
+      match /{subcollection=**} {
+        allow read, write: if request.auth != null && pharmacyId == 'pharmacy_' + request.auth.uid;
+      }
+    }
+  }
+}

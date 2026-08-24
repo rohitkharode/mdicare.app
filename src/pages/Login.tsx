@@ -1,58 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import { useGoogleLogin } from '@react-oauth/google';
 import { useAuth } from '../context/AuthContext';
-import { initDB, getUserByEmail } from '../lib/db';
-import { hashPassword } from '../lib/crypto';
 import { Mail, Lock, Eye, EyeOff, ArrowRight, Chrome } from 'lucide-react';
 import { cn } from '../lib/utils';
 
-function GoogleLoginButton({ onLogin, onError, setIsLoading }: { 
-  onLogin: (token: string, user: any) => void, 
-  onError: (error: string) => void,
-  setIsLoading: (loading: boolean) => void
-}) {
-  const googleLogin = useGoogleLogin({
-    onSuccess: async (tokenResponse) => {
-      setIsLoading(true);
-      try {
-        const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-          headers: { Authorization: `Bearer ${tokenResponse.access_token}` },
-        });
-        const payload = await res.json();
-        
-        if (payload) {
-          onLogin(tokenResponse.access_token, {
-            name: payload.name,
-            email: payload.email,
-            picture: payload.picture
-          });
-        }
-      } catch (err) {
-        onError('Google login failed. Please try again.');
-        console.error(err);
-      } finally {
-        setIsLoading(false);
-      }
-    },
-    onError: () => {
-      onError('Google login failed');
-    },
-  });
-
-  return (
-    <button
-      onClick={() => googleLogin()}
-      className="w-full flex items-center justify-center gap-3 py-3 bg-white hover:bg-slate-50 text-slate-900 font-semibold rounded-xl transition-all shadow-sm border border-slate-200"
-    >
-      <Chrome className="w-5 h-5 text-blue-500" />
-      Google Account
-    </button>
-  );
-}
-
 export default function Login() {
-  const { login, isAuthenticated } = useAuth();
+  const { login, loginWithGoogle, isAuthenticated, loading } = useAuth();
   const navigate = useNavigate();
 
   const [email, setEmail] = useState('');
@@ -63,15 +16,23 @@ export default function Login() {
   const [isLoading, setIsLoading] = useState(false);
 
   useEffect(() => {
-    if (isAuthenticated) {
+    if (!loading && isAuthenticated) {
       navigate('/', { replace: true });
     }
-  }, [isAuthenticated, navigate]);
+  }, [isAuthenticated, loading, navigate]);
 
-  const handleGoogleSuccess = async (token: string, userData: any) => {
-    await initDB();
-    login(token, userData, true);
-    navigate('/');
+  const handleGoogleClick = async () => {
+    setError('');
+    setIsLoading(true);
+    try {
+      await loginWithGoogle();
+      navigate('/');
+    } catch (err: any) {
+      setError(err?.message || 'Google login failed. Please try again.');
+      console.error(err);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const handleEmailLogin = async (e: React.FormEvent) => {
@@ -80,34 +41,15 @@ export default function Login() {
     setIsLoading(true);
 
     try {
-      await initDB();
-      const user = await getUserByEmail(email);
-      
-      if (!user) {
-        setError('Invalid email or password');
-        setIsLoading(false);
-        return;
-      }
-
-      const inputHash = await hashPassword(password);
-      if (user.passwordHash !== inputHash) {
-        setError('Invalid email or password');
-        setIsLoading(false);
-        return;
-      }
-
-      const token = `local_${btoa(email)}_${Date.now()}`;
-      login(token, { name: user.name, email: user.email, picture: '' }, rememberMe);
+      await login(email, password);
       navigate('/');
-    } catch (err) {
-      setError('Login failed. Please try again.');
+    } catch (err: any) {
+      setError(err?.message || 'Invalid email or password');
       console.error(err);
     } finally {
       setIsLoading(false);
     }
   };
-
-  const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID;
 
   return (
     <div className="min-h-screen bg-[#0f172a] flex flex-col items-center justify-center p-4 font-sans selection:bg-blue-500/30">
@@ -222,18 +164,15 @@ export default function Login() {
             </div>
 
             <div className="flex justify-center">
-              {clientId ? (
-                <GoogleLoginButton 
-                  onLogin={handleGoogleSuccess} 
-                  onError={setError} 
-                  setIsLoading={setIsLoading} 
-                />
-              ) : (
-                <div className="w-full p-4 bg-amber-500/10 border border-amber-500/20 rounded-xl text-amber-500 text-sm text-center">
-                  <p className="font-bold mb-1 tracking-tight">Google Login Unavailable</p>
-                  <p className="text-slate-400 text-xs">Client ID not configured in environment.</p>
-                </div>
-              )}
+              <button
+                type="button"
+                onClick={handleGoogleClick}
+                disabled={isLoading}
+                className="w-full flex items-center justify-center gap-3 py-3 bg-white hover:bg-slate-50 text-slate-900 font-semibold rounded-xl transition-all shadow-sm border border-slate-200"
+              >
+                <Chrome className="w-5 h-5 text-blue-500" />
+                Google Account
+              </button>
             </div>
             
             <div className="w-full border-t border-slate-800 pt-6">

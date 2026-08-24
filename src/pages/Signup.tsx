@@ -1,12 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
-import { initDB, createUser, getUserByEmail } from '../lib/db';
-import { hashPassword } from '../lib/crypto';
 import { Mail, Lock, User, ArrowRight, ShieldCheck } from 'lucide-react';
 
 export default function Signup() {
-  const { login, isAuthenticated } = useAuth();
+  const { signup, isAuthenticated, loading } = useAuth();
   const navigate = useNavigate();
   
   const [name, setName] = useState('');
@@ -17,10 +15,10 @@ export default function Signup() {
   const [isLoading, setIsLoading] = useState(false);
 
   useEffect(() => {
-    if (isAuthenticated) {
+    if (!loading && isAuthenticated) {
       navigate('/', { replace: true });
     }
-  }, [isAuthenticated, navigate]);
+  }, [isAuthenticated, loading, navigate]);
 
   const handleSignup = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -34,32 +32,10 @@ export default function Signup() {
     }
 
     try {
-      await initDB();
-      
-      const existingUser = await getUserByEmail(email);
-      if (existingUser) {
-        setError('Email is already registered');
-        setIsLoading(false);
-        return;
-      }
-
-      const passwordHash = await hashPassword(password);
-      
-      const newUser = {
-        email,
-        name,
-        passwordHash,
-        created_at: new Date().toISOString()
-      };
-
-      await createUser(newUser);
-      
-      // Auto login after signup
-      const token = `local_${btoa(email)}_${Date.now()}`;
-      login(token, { name, email, picture: '' }, true);
+      await signup(name, email, password);
       navigate('/');
-    } catch (err) {
-      setError('Failed to create account');
+    } catch (err: any) {
+      setError(err?.message || 'Failed to create account');
       console.error(err);
     } finally {
       setIsLoading(false);
