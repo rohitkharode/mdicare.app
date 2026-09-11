@@ -10,7 +10,8 @@ import {
   deleteDoc,
   query,
   orderBy,
-  runTransaction
+  runTransaction,
+  writeBatch
 } from 'firebase/firestore';
 import { db as firestoreDb, auth } from './firebase';
 
@@ -126,7 +127,6 @@ export interface Notification {
   read: boolean;
 }
 
-// --- Local IndexedDB setup for legacy migration ---
 interface MdiCareDB extends DBSchema {
   inventory: { key: number; value: InventoryItem; indexes: { 'by-name': string; 'by-expiry': string } };
   suppliers: { key: number; value: Supplier };
@@ -164,16 +164,35 @@ const getPharmacyId = (): string => {
   return user ? `pharmacy_${user.uid}` : 'pharmacy_default';
 };
 
-// --- Firestore Helpers ---
+// Prevent duplicate writes caused by repeated clicks while a Firestore request is still pending.
+const inFlightOperations = new Map<string, Promise<unknown>>();
+
+const runDeduped = <T>(key: string, operation: () => Promise<T>): Promise<T> => {
+  const existing = inFlightOperations.get(key) as Promise<T> | undefined;
+  if (existing) return existing;
+
+  const promise = operation().finally(() => {
+    if (inFlightOperations.get(key) === promise) inFlightOperations.delete(key);
+  });
+  inFlightOperations.set(key, promise);
+  return promise;
+};
+
+const stableKey = (value: unknown): string => {
+  if (Array.isArray(value)) return `[${value.map(stableKey).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, val]) => `${JSON.stringify(key)}:${stableKey(val)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
+};
 
 export const getInventory = async (): Promise<InventoryItem[]> => {
   const pharmacyId = getPharmacyId();
-  const colRef = collection(firestoreDb, 'pharmacies', pharmacyId, 'medicines');
-  const snap = await getDocs(colRef);
-  return snap.docs.map(docSnap => ({
-    id: docSnap.id,
-    ...docSnap.data()
-  } as InventoryItem));
+  const snap = await getDocs(collection(firestoreDb, 'pharmacies', pharmacyId, 'medicines'));
+  return snap.docs.map(docSnap => ({ id: docSnap.id, ...docSnap.data() } as InventoryItem));
 };
 
 export const addInventory = async (
@@ -181,49 +200,49 @@ export const addInventory = async (
   paymentDetails?: { status: 'paid' | 'pending', amount: number }
 ) => {
   const pharmacyId = getPharmacyId();
-  const colRef = collection(firestoreDb, 'pharmacies', pharmacyId, 'medicines');
-  const docRef = await addDoc(colRef, item);
+  const dedupeItem = { ...item };
+  delete dedupeItem.created_at;
+  delete dedupeItem.updated_at;
+  const operationKey = `inventory:${pharmacyId}:${stableKey({ item: dedupeItem, paymentDetails })}`;
 
-  // Add stock log
-  const logsRef = collection(firestoreDb, 'pharmacies', pharmacyId, 'inventoryLogs');
-  await addDoc(logsRef, {
-    medicine_id: docRef.id,
-    medicine_name: item.medicine_name,
-    batch_no: item.batch_no,
-    change_type: 'added',
-    qty_change: item.total_qty,
-    updated_total: item.total_qty,
-    timestamp: new Date().toISOString(),
-    supplier_id: item.supplier_id || '',
-    invoice_amount: paymentDetails?.amount || 0,
-    payment_status: paymentDetails?.status || 'paid'
+  return runDeduped(operationKey, async () => {
+    const medicineRef = doc(collection(firestoreDb, 'pharmacies', pharmacyId, 'medicines'));
+    const logRef = doc(collection(firestoreDb, 'pharmacies', pharmacyId, 'inventoryLogs'));
+    const batch = writeBatch(firestoreDb);
+    batch.set(medicineRef, item);
+    batch.set(logRef, {
+      medicine_id: medicineRef.id,
+      medicine_name: item.medicine_name,
+      batch_no: item.batch_no,
+      change_type: 'added',
+      qty_change: item.total_qty,
+      updated_total: item.total_qty,
+      timestamp: new Date().toISOString(),
+      supplier_id: item.supplier_id || '',
+      invoice_amount: paymentDetails?.amount || 0,
+      payment_status: paymentDetails?.status || 'paid'
+    });
+    await batch.commit();
+    return medicineRef.id;
   });
-
-  return docRef.id;
 };
 
 export const updateInventory = async (item: InventoryItem) => {
   if (!item.id) return;
   const pharmacyId = getPharmacyId();
   const docRef = doc(firestoreDb, 'pharmacies', pharmacyId, 'medicines', String(item.id));
-  
   const oldSnap = await getDoc(docRef);
   const oldItem = oldSnap.exists() ? oldSnap.data() as InventoryItem : null;
-
   const { id, ...data } = item;
   await setDoc(docRef, data, { merge: true });
-
   if (oldItem) {
     const settings = await getSettings();
     const threshold = settings?.global_low_stock_threshold || 50;
     if (oldItem.total_qty > threshold && item.total_qty <= threshold) {
-      const notifRef = collection(firestoreDb, 'pharmacies', pharmacyId, 'notifications');
-      await addDoc(notifRef, {
+      await addDoc(collection(firestoreDb, 'pharmacies', pharmacyId, 'notifications'), {
         title: 'Low Stock Alert',
         message: `${item.medicine_name} has dropped to ${item.total_qty} units.`,
-        timestamp: new Date().toISOString(),
-        type: 'low_stock',
-        read: false
+        timestamp: new Date().toISOString(), type: 'low_stock', read: false
       });
     }
   }
@@ -231,8 +250,7 @@ export const updateInventory = async (item: InventoryItem) => {
 
 export const deleteInventoryItem = async (id: number | string) => {
   const pharmacyId = getPharmacyId();
-  const docRef = doc(firestoreDb, 'pharmacies', pharmacyId, 'medicines', String(id));
-  await deleteDoc(docRef);
+  await deleteDoc(doc(firestoreDb, 'pharmacies', pharmacyId, 'medicines', String(id)));
 };
 
 export const bulkReturnToSupplier = async (itemIds: (number | string)[], supplierId?: number | string) => {
@@ -242,14 +260,9 @@ export const bulkReturnToSupplier = async (itemIds: (number | string)[], supplie
     const snap = await getDoc(docRef);
     if (snap.exists()) {
       const item = snap.data() as InventoryItem;
-      const logsRef = collection(firestoreDb, 'pharmacies', pharmacyId, 'inventoryLogs');
-      await addDoc(logsRef, {
-        medicine_id: String(id),
-        medicine_name: item.medicine_name,
-        batch_no: item.batch_no,
-        change_type: 'removed',
-        qty_change: -item.total_qty,
-        updated_total: 0,
+      await addDoc(collection(firestoreDb, 'pharmacies', pharmacyId, 'inventoryLogs'), {
+        medicine_id: String(id), medicine_name: item.medicine_name, batch_no: item.batch_no,
+        change_type: 'removed', qty_change: -item.total_qty, updated_total: 0,
         timestamp: new Date().toISOString()
       });
       await deleteDoc(docRef);
@@ -259,28 +272,24 @@ export const bulkReturnToSupplier = async (itemIds: (number | string)[], supplie
 
 export const getSuppliers = async (): Promise<Supplier[]> => {
   const pharmacyId = getPharmacyId();
-  const colRef = collection(firestoreDb, 'pharmacies', pharmacyId, 'suppliers');
-  const snap = await getDocs(colRef);
-  return snap.docs.map(docSnap => ({
-    id: docSnap.id,
-    ...docSnap.data()
-  } as Supplier));
+  const snap = await getDocs(collection(firestoreDb, 'pharmacies', pharmacyId, 'suppliers'));
+  return snap.docs.map(docSnap => ({ id: docSnap.id, ...docSnap.data() } as Supplier));
 };
 
 export const addSupplier = async (supplier: Omit<Supplier, 'id'>) => {
   const pharmacyId = getPharmacyId();
-  const colRef = collection(firestoreDb, 'pharmacies', pharmacyId, 'suppliers');
-  const docRef = await addDoc(colRef, supplier);
-  return docRef.id;
+  const operationKey = `supplier:${pharmacyId}:${stableKey(supplier)}`;
+  return runDeduped(operationKey, async () => {
+    const docRef = await addDoc(collection(firestoreDb, 'pharmacies', pharmacyId, 'suppliers'), supplier);
+    return docRef.id;
+  });
 };
 
 export const getSettings = async (): Promise<Settings> => {
   const pharmacyId = getPharmacyId();
   const docRef = doc(firestoreDb, 'pharmacies', pharmacyId, 'settings', 'config');
   const snap = await getDoc(docRef);
-  if (snap.exists()) {
-    return snap.data() as Settings;
-  }
+  if (snap.exists()) return snap.data() as Settings;
   const defaultSettings: Settings = {
     global_low_stock_threshold: 50,
     expiry_alert_lead_time: 60,
@@ -296,120 +305,83 @@ export const getSettings = async (): Promise<Settings> => {
 
 export const saveSettings = async (settings: Settings) => {
   const pharmacyId = getPharmacyId();
-  const docRef = doc(firestoreDb, 'pharmacies', pharmacyId, 'settings', 'config');
-  await setDoc(docRef, settings, { merge: true });
+  await setDoc(doc(firestoreDb, 'pharmacies', pharmacyId, 'settings', 'config'), settings, { merge: true });
 };
 
 export const createBill = async (bill: Omit<Bill, 'bill_id'>): Promise<string> => {
   const pharmacyId = getPharmacyId();
-  const settings = await getSettings();
-  const prefix = settings?.invoice_prefix || 'INV-';
+  const { bill_date, ...billWithoutDate } = bill;
+  const operationKey = `bill:${pharmacyId}:${stableKey(billWithoutDate)}`;
 
-  const metaRef = doc(firestoreDb, 'pharmacies', pharmacyId, 'billing', 'metadata');
-  
-  let newBillId = `${prefix}0001`;
+  return runDeduped(operationKey, async () => {
+    const settings = await getSettings();
+    const prefix = settings?.invoice_prefix || 'INV-';
+    const metaRef = doc(firestoreDb, 'pharmacies', pharmacyId, 'billing', 'metadata');
+    let newBillId = `${prefix}0001`;
 
-  await runTransaction(firestoreDb, async (transaction) => {
-    // READ 1: Metadata
-    const metaSnap = await transaction.get(metaRef);
-    let lastId = 0;
-    if (metaSnap.exists()) {
-      lastId = metaSnap.data().last_bill_id || 0;
-    }
-    lastId += 1;
-    newBillId = `${prefix}${lastId.toString().padStart(4, '0')}`;
+    await runTransaction(firestoreDb, async (transaction) => {
+      const metaSnap = await transaction.get(metaRef);
+      let lastId = metaSnap.exists() ? (metaSnap.data().last_bill_id || 0) : 0;
+      lastId += 1;
+      newBillId = `${prefix}${lastId.toString().padStart(4, '0')}`;
 
-    // READ 2: Inventory Items BEFORE ANY WRITES
-    const invItemsToUpdate: { ref: any; data: InventoryItem; item: BillingItem }[] = [];
-    for (const item of bill.items) {
-      const itemKey = String(item.medicine_id || item.item_id);
-      const invRef = doc(firestoreDb, 'pharmacies', pharmacyId, 'medicines', itemKey);
-      const invSnap = await transaction.get(invRef);
-      if (invSnap.exists()) {
-        invItemsToUpdate.push({
-          ref: invRef,
-          data: invSnap.data() as InventoryItem,
-          item
-        });
+      const invItemsToUpdate: { ref: any; data: InventoryItem; item: BillingItem }[] = [];
+      for (const item of bill.items) {
+        const itemKey = String(item.medicine_id || item.item_id);
+        const invRef = doc(firestoreDb, 'pharmacies', pharmacyId, 'medicines', itemKey);
+        const invSnap = await transaction.get(invRef);
+        if (invSnap.exists()) invItemsToUpdate.push({ ref: invRef, data: invSnap.data() as InventoryItem, item });
       }
-    }
 
-    // NOW EXECUTE WRITES:
-    // 1. Update metadata
-    transaction.set(metaRef, { last_bill_id: lastId }, { merge: true });
+      transaction.set(metaRef, { last_bill_id: lastId }, { merge: true });
+      const billRef = doc(firestoreDb, 'pharmacies', pharmacyId, 'bills', newBillId);
+      transaction.set(billRef, { ...bill, bill_id: newBillId });
 
-    // 2. Add Bill
-    const billRef = doc(firestoreDb, 'pharmacies', pharmacyId, 'bills', newBillId);
-    const finalBill: Bill = {
-      ...bill,
-      bill_id: newBillId
-    };
-    transaction.set(billRef, finalBill);
+      const notifRef = doc(collection(firestoreDb, 'pharmacies', pharmacyId, 'notifications'));
+      transaction.set(notifRef, {
+        title: 'New Bill Created',
+        message: `Bill #${newBillId} for $${bill.total_amount.toFixed(2)}`,
+        timestamp: new Date().toISOString(), type: 'bill', read: false
+      });
 
-    // 3. Notification
-    const notifRef = doc(collection(firestoreDb, 'pharmacies', pharmacyId, 'notifications'));
-    transaction.set(notifRef, {
-      title: 'New Bill Created',
-      message: `Bill #${finalBill.bill_id} for $${finalBill.total_amount.toFixed(2)}`,
-      timestamp: new Date().toISOString(),
-      type: 'bill',
-      read: false
+      const threshold = settings?.global_low_stock_threshold || 50;
+      for (const { ref, data: invData, item } of invItemsToUpdate) {
+        const newQty = invData.total_qty - item.qty;
+        transaction.update(ref, { total_qty: newQty, updated_at: new Date().toISOString() });
+        const logRef = doc(collection(firestoreDb, 'pharmacies', pharmacyId, 'inventoryLogs'));
+        transaction.set(logRef, {
+          medicine_id: String(item.medicine_id || item.item_id),
+          medicine_name: invData.medicine_name,
+          batch_no: invData.batch_no,
+          change_type: 'sale',
+          qty_change: -item.qty,
+          updated_total: newQty,
+          timestamp: new Date().toISOString()
+        });
+        if (invData.total_qty > threshold && newQty <= threshold) {
+          const lowNotifRef = doc(collection(firestoreDb, 'pharmacies', pharmacyId, 'notifications'));
+          transaction.set(lowNotifRef, {
+            title: 'Low Stock Alert',
+            message: `${invData.medicine_name} has dropped to ${newQty} units.`,
+            timestamp: new Date().toISOString(), type: 'low_stock', read: false
+          });
+        }
+      }
     });
-
-    // 4. Update Inventory & Logs
-    const threshold = settings?.global_low_stock_threshold || 50;
-
-    for (const { ref, data: invData, item } of invItemsToUpdate) {
-      const oldQty = invData.total_qty;
-      const newQty = invData.total_qty - item.qty;
-
-      transaction.update(ref, {
-        total_qty: newQty,
-        updated_at: new Date().toISOString()
-      });
-
-      const logRef = doc(collection(firestoreDb, 'pharmacies', pharmacyId, 'inventoryLogs'));
-      transaction.set(logRef, {
-        medicine_id: String(item.medicine_id || item.item_id),
-        medicine_name: invData.medicine_name,
-        batch_no: invData.batch_no,
-        change_type: 'sale',
-        qty_change: -item.qty,
-        updated_total: newQty,
-        timestamp: new Date().toISOString()
-      });
-
-      if (oldQty > threshold && newQty <= threshold) {
-        const lowNotifRef = doc(collection(firestoreDb, 'pharmacies', pharmacyId, 'notifications'));
-        transaction.set(lowNotifRef, {
-          title: 'Low Stock Alert',
-          message: `${invData.medicine_name} has dropped to ${newQty} units.`,
-          timestamp: new Date().toISOString(),
-          type: 'low_stock',
-          read: false
-        });
-      }
-    }
+    return newBillId;
   });
-
-  return newBillId;
 };
 
 export const getBills = async (): Promise<Bill[]> => {
   const pharmacyId = getPharmacyId();
-  const colRef = collection(firestoreDb, 'pharmacies', pharmacyId, 'bills');
-  const snap = await getDocs(colRef);
+  const snap = await getDocs(collection(firestoreDb, 'pharmacies', pharmacyId, 'bills'));
   return snap.docs.map(docSnap => docSnap.data() as Bill);
 };
 
 export const getLogs = async (): Promise<StockLog[]> => {
   const pharmacyId = getPharmacyId();
-  const colRef = collection(firestoreDb, 'pharmacies', pharmacyId, 'inventoryLogs');
-  const snap = await getDocs(colRef);
-  return snap.docs.map(docSnap => ({
-    log_id: docSnap.id,
-    ...docSnap.data()
-  } as StockLog));
+  const snap = await getDocs(collection(firestoreDb, 'pharmacies', pharmacyId, 'inventoryLogs'));
+  return snap.docs.map(docSnap => ({ log_id: docSnap.id, ...docSnap.data() } as StockLog));
 };
 
 export const updateLog = async (log: StockLog) => {
@@ -424,9 +396,7 @@ export const getUserProfile = async (): Promise<UserProfile> => {
   const pharmacyId = getPharmacyId();
   const docRef = doc(firestoreDb, 'pharmacies', pharmacyId, 'user_profile', 'profile');
   const snap = await getDoc(docRef);
-  if (snap.exists()) {
-    return snap.data() as UserProfile;
-  }
+  if (snap.exists()) return snap.data() as UserProfile;
   const defaultProfile: UserProfile = {
     full_name: auth.currentUser?.displayName || 'Pharmacist',
     phone_number: '+1 234 567 8900',
@@ -444,49 +414,35 @@ export const getUserProfile = async (): Promise<UserProfile> => {
 
 export const saveUserProfile = async (profile: UserProfile) => {
   const pharmacyId = getPharmacyId();
-  const docRef = doc(firestoreDb, 'pharmacies', pharmacyId, 'user_profile', 'profile');
-  await setDoc(docRef, profile, { merge: true });
+  await setDoc(doc(firestoreDb, 'pharmacies', pharmacyId, 'user_profile', 'profile'), profile, { merge: true });
 };
 
 export const getNotifications = async (): Promise<Notification[]> => {
   const pharmacyId = getPharmacyId();
-  const colRef = collection(firestoreDb, 'pharmacies', pharmacyId, 'notifications');
-  const snap = await getDocs(colRef);
-  const items = snap.docs.map(docSnap => ({
-    id: docSnap.id,
-    ...docSnap.data()
-  } as Notification));
+  const snap = await getDocs(collection(firestoreDb, 'pharmacies', pharmacyId, 'notifications'));
+  const items = snap.docs.map(docSnap => ({ id: docSnap.id, ...docSnap.data() } as Notification));
   return items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
 };
 
 export const addNotification = async (notification: Omit<Notification, 'id'>) => {
   const pharmacyId = getPharmacyId();
-  const colRef = collection(firestoreDb, 'pharmacies', pharmacyId, 'notifications');
-  await addDoc(colRef, notification);
+  await addDoc(collection(firestoreDb, 'pharmacies', pharmacyId, 'notifications'), notification);
 };
 
 export const markNotificationRead = async (id: number | string) => {
   const pharmacyId = getPharmacyId();
-  const docRef = doc(firestoreDb, 'pharmacies', pharmacyId, 'notifications', String(id));
-  await updateDoc(docRef, { read: true });
+  await updateDoc(doc(firestoreDb, 'pharmacies', pharmacyId, 'notifications', String(id)), { read: true });
 };
 
 export const markAllNotificationsRead = async () => {
   const pharmacyId = getPharmacyId();
-  const colRef = collection(firestoreDb, 'pharmacies', pharmacyId, 'notifications');
-  const snap = await getDocs(colRef);
-  for (const docSnap of snap.docs) {
-    if (!docSnap.data().read) {
-      await updateDoc(docSnap.ref, { read: true });
-    }
-  }
+  const snap = await getDocs(collection(firestoreDb, 'pharmacies', pharmacyId, 'notifications'));
+  for (const docSnap of snap.docs) if (!docSnap.data().read) await updateDoc(docSnap.ref, { read: true });
 };
 
 export const checkExpiryNotifications = async () => {
-  const pharmacyId = getPharmacyId();
   const settings = await getSettings();
   const leadTime = settings?.expiry_alert_lead_time || 60;
-
   const medicines = await getInventory();
   const now = new Date();
   const threshold = new Date();
@@ -496,15 +452,11 @@ export const checkExpiryNotifications = async () => {
     if (!item.expiry_notified && item.expiry_date) {
       const expDate = new Date(item.expiry_date);
       if (expDate <= threshold && expDate >= now) {
-        const notifRef = collection(firestoreDb, 'pharmacies', pharmacyId, 'notifications');
-        await addDoc(notifRef, {
+        await addNotification({
           title: 'Expiry Alert',
           message: `${item.medicine_name} (Batch: ${item.batch_no}) is expiring on ${item.expiry_date}.`,
-          timestamp: new Date().toISOString(),
-          type: 'expiry',
-          read: false
+          timestamp: new Date().toISOString(), type: 'expiry', read: false
         });
-
         item.expiry_notified = true;
         await updateInventory(item);
       }
@@ -526,30 +478,20 @@ export const exportData = async () => {
 export const importData = async (jsonData: string) => {
   const data = JSON.parse(jsonData);
   const pharmacyId = getPharmacyId();
-  
   if (data.inventory && Array.isArray(data.inventory)) {
     for (const item of data.inventory) {
       const { id, ...itemData } = item;
       await addDoc(collection(firestoreDb, 'pharmacies', pharmacyId, 'medicines'), itemData);
     }
   }
-
   if (data.suppliers && Array.isArray(data.suppliers)) {
     for (const supplier of data.suppliers) {
       const { id, ...supplierData } = supplier;
       await addDoc(collection(firestoreDb, 'pharmacies', pharmacyId, 'suppliers'), supplierData);
     }
   }
-
-  if (data.settings) {
-    await saveSettings(data.settings);
-  }
+  if (data.settings) await saveSettings(data.settings);
 };
 
-export const getUserByEmail = async (email: string) => {
-  return null;
-};
-
-export const createUser = async (user: User) => {
-  return;
-};
+export const getUserByEmail = async (email: string) => null;
+export const createUser = async (user: User) => { return; };
