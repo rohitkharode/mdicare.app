@@ -5,29 +5,36 @@ service cloud.firestore {
 
     // Each authenticated user can access only their own user document.
     match /users/{userId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+      allow read, write: if request.auth != null
+        && request.auth.uid == userId;
     }
 
-    // A pharmacy currently belongs to the Firebase user whose UID is part of
-    // its ID (pharmacy_<uid>). The owner ID is also validated on creation and
-    // cannot be changed later.
+    // Each pharmacy belongs to exactly one Firebase Auth user.
     match /pharmacies/{pharmacyId} {
+      // The pharmacy document is created by the authenticated owner.
       allow create: if request.auth != null
         && pharmacyId == 'pharmacy_' + request.auth.uid
         && request.resource.data.ownerId == request.auth.uid;
 
-      allow read, delete: if request.auth != null
-        && pharmacyId == 'pharmacy_' + request.auth.uid
-        && resource.data.ownerId == request.auth.uid;
+      // Path-based ownership is safe here because pharmacyId contains the
+      // authenticated user's UID. This also lets first-login getDoc() return
+      // "not found" instead of "permission denied" when the doc is absent.
+      allow read: if request.auth != null
+        && pharmacyId == 'pharmacy_' + request.auth.uid;
 
+      // Owner-only updates/deletes. ownerId cannot be changed by an update.
       allow update: if request.auth != null
         && pharmacyId == 'pharmacy_' + request.auth.uid
         && resource.data.ownerId == request.auth.uid
-        && request.resource.data.ownerId == resource.data.ownerId;
+        && request.resource.data.ownerId == request.auth.uid;
 
-      // All current pharmacy data lives below the owner's pharmacy document.
-      // Keep the path-based check so one authenticated user cannot access
-      // another user's medicines, bills, suppliers, logs, etc.
+      allow delete: if request.auth != null
+        && pharmacyId == 'pharmacy_' + request.auth.uid
+        && resource.data.ownerId == request.auth.uid;
+
+      // All application data lives under the authenticated user's pharmacy.
+      // This covers medicines, suppliers, bills, inventory logs,
+      // notifications, settings, and billing metadata.
       match /{subcollection=**} {
         allow read, write: if request.auth != null
           && pharmacyId == 'pharmacy_' + request.auth.uid;
