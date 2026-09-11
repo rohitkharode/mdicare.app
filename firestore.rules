@@ -3,22 +3,34 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // User profile documents
+    // Each authenticated user can access only their own user document.
     match /users/{userId} {
       allow read, write: if request.auth != null && request.auth.uid == userId;
     }
 
-    // Pharmacy documents and subcollections
+    // A pharmacy currently belongs to the Firebase user whose UID is part of
+    // its ID (pharmacy_<uid>). The owner ID is also validated on creation and
+    // cannot be changed later.
     match /pharmacies/{pharmacyId} {
-      // Allow read/write if the pharmacyId matches pharmacy_{request.auth.uid} or user is the pharmacy owner
-      allow read, write: if request.auth != null && (
-        pharmacyId == 'pharmacy_' + request.auth.uid ||
-        resource == null ||
-        resource.data.ownerId == request.auth.uid
-      );
+      allow create: if request.auth != null
+        && pharmacyId == 'pharmacy_' + request.auth.uid
+        && request.resource.data.ownerId == request.auth.uid;
 
+      allow read, delete: if request.auth != null
+        && pharmacyId == 'pharmacy_' + request.auth.uid
+        && resource.data.ownerId == request.auth.uid;
+
+      allow update: if request.auth != null
+        && pharmacyId == 'pharmacy_' + request.auth.uid
+        && resource.data.ownerId == request.auth.uid
+        && request.resource.data.ownerId == resource.data.ownerId;
+
+      // All current pharmacy data lives below the owner's pharmacy document.
+      // Keep the path-based check so one authenticated user cannot access
+      // another user's medicines, bills, suppliers, logs, etc.
       match /{subcollection=**} {
-        allow read, write: if request.auth != null && pharmacyId == 'pharmacy_' + request.auth.uid;
+        allow read, write: if request.auth != null
+          && pharmacyId == 'pharmacy_' + request.auth.uid;
       }
     }
   }
