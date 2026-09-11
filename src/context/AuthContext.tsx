@@ -31,6 +31,9 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+const getUserName = (fbUser: FirebaseUser, displayName?: string) =>
+  displayName || fbUser.displayName || fbUser.email?.split('@')[0] || 'User';
+
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<UserData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -43,68 +46,68 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const data = userSnap.data();
       return {
         uid: fbUser.uid,
-        name: data.name || displayName || fbUser.displayName || fbUser.email?.split('@')[0] || 'User',
-        email: fbUser.email || '',
+        name: data.name || getUserName(fbUser, displayName),
+        email: fbUser.email || data.email || '',
         picture: fbUser.photoURL || '',
         pharmacyId: data.pharmacyId || `pharmacy_${fbUser.uid}`,
         role: data.role || 'owner'
       };
-    } else {
-      const pharmacyId = `pharmacy_${fbUser.uid}`;
-      const name = displayName || fbUser.displayName || fbUser.email?.split('@')[0] || 'User';
+    }
 
-      const userData: UserData = {
-        uid: fbUser.uid,
-        name,
-        email: fbUser.email || '',
-        picture: fbUser.photoURL || '',
-        pharmacyId,
-        role: 'owner'
-      };
+    const pharmacyId = `pharmacy_${fbUser.uid}`;
+    const name = getUserName(fbUser, displayName);
+    const userData: UserData = {
+      uid: fbUser.uid,
+      name,
+      email: fbUser.email || '',
+      picture: fbUser.photoURL || '',
+      pharmacyId,
+      role: 'owner'
+    };
 
-      await setDoc(userRef, {
-        name: userData.name,
-        email: userData.email,
-        pharmacyId,
-        role: userData.role,
+    await setDoc(userRef, {
+      name: userData.name,
+      email: userData.email,
+      pharmacyId,
+      role: userData.role,
+      createdAt: new Date().toISOString()
+    });
+
+    const pharmacyRef = doc(db, 'pharmacies', pharmacyId);
+    const pharmacySnap = await getDoc(pharmacyRef);
+    if (!pharmacySnap.exists()) {
+      await setDoc(pharmacyRef, {
+        pharmacyName: `${name}'s Pharmacy`,
+        ownerId: fbUser.uid,
         createdAt: new Date().toISOString()
       });
-
-      // Ensure pharmacy doc
-      const pharmacyRef = doc(db, 'pharmacies', pharmacyId);
-      const pharmacySnap = await getDoc(pharmacyRef);
-      if (!pharmacySnap.exists()) {
-        await setDoc(pharmacyRef, {
-          pharmacyName: `${name}'s Pharmacy`,
-          ownerId: fbUser.uid,
-          createdAt: new Date().toISOString()
-        });
-      }
-
-      return userData;
     }
+
+    return userData;
   };
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (fbUser) => {
-      if (fbUser) {
-        try {
-          const userData = await ensureUserDocument(fbUser);
-          setUser(userData);
-        } catch (err) {
-          console.error("Error fetching user document:", err);
-          setUser({
-            uid: fbUser.uid,
-            name: fbUser.displayName || fbUser.email?.split('@')[0] || 'User',
-            email: fbUser.email || '',
-            picture: fbUser.photoURL || '',
-            pharmacyId: `pharmacy_${fbUser.uid}`
-          });
-        }
-      } else {
+      setLoading(true);
+
+      if (!fbUser) {
         setUser(null);
+        setLoading(false);
+        return;
       }
-      setLoading(false);
+
+      try {
+        const userData = await ensureUserDocument(fbUser);
+        setUser(userData);
+      } catch (err) {
+        // Do not treat a Firebase/Firestore failure as a successful login.
+        // The old fallback created an authenticated UI state even when the
+        // user's Firestore document could not be read or created.
+        console.error('Failed to initialize authenticated user:', err);
+        setUser(null);
+      } finally {
+        setLoading(false);
+      }
     });
 
     return () => unsubscribe();
